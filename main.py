@@ -31,6 +31,7 @@ import json
 import io
 import wave
 from starlette.websockets import WebSocketState
+# messaging package lives alongside this module
 from messaging import init_messaging
 
 try:
