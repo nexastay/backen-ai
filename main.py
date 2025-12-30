@@ -59,16 +59,31 @@ if _bcrypt is not None:
 
     if _orig_hashpw:
         _bcrypt.hashpw = _hashpw_trunc  # type: ignore[attr-defined]
-try:
-    from vosk import Model, KaldiRecognizer
-except Exception:  # noqa: BLE001
+ENABLE_SPEECH = os.getenv("ENABLE_SPEECH", "false").lower() == "true"
+ENABLE_FACE = os.getenv("ENABLE_FACE", "false").lower() == "true"
+
+if ENABLE_SPEECH:
+    try:
+        from vosk import Model, KaldiRecognizer
+    except Exception:  # noqa: BLE001
+        ENABLE_SPEECH = False
+        Model = None
+        KaldiRecognizer = None
+else:
     Model = None
     KaldiRecognizer = None
-try:
-    from deepface import DeepFace
-    import cv2
-    import numpy as np
-except Exception:  # noqa: BLE001
+
+if ENABLE_FACE:
+    try:
+        from deepface import DeepFace
+        import cv2
+        import numpy as np
+    except Exception:  # noqa: BLE001
+        ENABLE_FACE = False
+        DeepFace = None
+        cv2 = None
+        np = None
+else:
     DeepFace = None
     cv2 = None
     np = None
@@ -958,8 +973,10 @@ async def transcribe_audio(file: UploadFile = File(...), current_user=Depends(ge
 
 
 def _ensure_face_model():
+    if not ENABLE_FACE:
+        raise HTTPException(status_code=503, detail="Reconnaissance faciale désactivée")
     if not DeepFace or not cv2 or not np:
-        raise HTTPException(status_code=500, detail="Librairie face non disponible")
+        raise HTTPException(status_code=503, detail="Bibliothèque faciale non disponible sur cet environnement")
 
 
 def _encode_face(content: bytes) -> "np.ndarray":
@@ -993,6 +1010,8 @@ def _cosine_similarity(a: List[float], b: List[float]) -> float:
 
 @app.post("/ai/face-enroll", response_model=FaceEnrollResponse)
 async def face_enroll(label: str = Form(...), file: UploadFile = File(...), current_user=Depends(get_current_user)):
+    if not ENABLE_FACE:
+        raise HTTPException(status_code=503, detail="Fonction d'enrôlement facial désactivée")
     content = await file.read()
     img = _encode_face(content)
     embedding = _compute_face_embedding(img)
@@ -1011,6 +1030,8 @@ async def face_enroll(label: str = Form(...), file: UploadFile = File(...), curr
 
 @app.post("/ai/face-match", response_model=FaceMatchResponse)
 async def face_match(file: UploadFile = File(...), current_user=Depends(get_current_user)):
+    if not ENABLE_FACE:
+        raise HTTPException(status_code=503, detail="Fonction de comparaison faciale désactivée")
     content = await file.read()
     img = _encode_face(content)
     embedding = _compute_face_embedding(img)
