@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+vosk-model-fr-0.22/
+*.pyd
+*.dll
+android/app/src/main/assets/frontend/
+Design sans titre (1).png
