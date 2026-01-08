@@ -1,11 +1,13 @@
 import os
 import re
+import secrets
 import smtplib
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, date
 from email.message import EmailMessage
 from pathlib import Path
-from typing import Dict, Optional, Sequence, List, Any
+from typing import Dict, Optional, Sequence, List, Any, Literal, Tuple
 from urllib.parse import urlparse
+from enum import Enum
 
 from dotenv import load_dotenv
 from fastapi import Depends, FastAPI, HTTPException, status, Request, UploadFile, File, WebSocket, WebSocketDisconnect, Form, Response
@@ -18,9 +20,10 @@ from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel, EmailStr, Field
 from bson import ObjectId
-from pymongo import ASCENDING, MongoClient
-from gridfs import GridFSBucket
+from pymongo import ASCENDING, DESCENDING, MongoClient
 from pymongo.collection import Collection
+from pymongo.errors import DuplicateKeyError
+from gridfs import GridFSBucket
 import httpx
 from bs4 import BeautifulSoup
 from dateutil import tz
@@ -109,6 +112,10 @@ JWT_SECRET = get_env("JWT_SECRET", "change-me")
 JWT_ALG = "HS256"
 JWT_EXP_MIN = int(os.getenv("JWT_EXP_MIN", "30"))
 JWT_REFRESH_EXP_DAYS = int(os.getenv("JWT_REFRESH_EXP_DAYS", "7"))
+AUTH_DISABLED = os.getenv("AUTH_DISABLED", "false").lower() == "true"
+AUTH_BYPASS_EMAIL = os.getenv("AUTH_BYPASS_EMAIL", "demo@neo.local")
+AUTH_BYPASS_PSEUDO = os.getenv("AUTH_BYPASS_PSEUDO", "demo")
+AUTH_BYPASS_NAME = os.getenv("AUTH_BYPASS_NAME", "Demo User")
 EMAIL_SENDER = get_env("MAIL_CONFIRMATION")
 EMAIL_PASSWORD = get_env("MOT_DE_PASSE_CONFIRMATION")
 EMAIL_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
@@ -118,6 +125,11 @@ PROJECT_NAME = os.getenv("APP_NAME", "Neo Auth")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.1-8b-instant")
 GROQ_MODEL_VISION = os.getenv("GROQ_MODEL_VISION", "llama-3.2-11b-vision-preview")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
+ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
+ANTHROPIC_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
+ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "1024"))
+ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages")
 WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
@@ -152,10 +164,19 @@ conversations: Collection = db["conversations"]
 messages_col: Collection = db["messages"]
 images_col: Collection = db["images"]
 faces_col: Collection = db["faces"]
+enterprises_col: Collection = db["enterprises"]
+enterprise_users_col: Collection = db["enterprise_users"]
+projects_col: Collection = db["projects"]
 conversations.create_index([("user_id", ASCENDING)], unique=False)
 messages_col.create_index([("conversation_id", ASCENDING), ("created_at", ASCENDING)])
 images_col.create_index([("user_id", ASCENDING), ("created_at", ASCENDING)])
 faces_col.create_index([("user_id", ASCENDING)], unique=False)
+enterprises_col.create_index([("code", ASCENDING)], unique=True)
+enterprises_col.create_index([("siret", ASCENDING)], unique=True, sparse=True)
+enterprise_users_col.create_index([("enterprise_id", ASCENDING), ("role", ASCENDING)])
+enterprise_users_col.create_index([("code", ASCENDING)], unique=True, sparse=True)
+projects_col.create_index([("enterprise_id", ASCENDING), ("code", ASCENDING)])
+projects_col.create_index([("analysis_status", ASCENDING)])
 file_storage = GridFSBucket(db, bucket_name="neo_files")
 
 pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
@@ -175,7 +196,7 @@ PASSWORD_REGEX = re.compile(
     r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$"
 )
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login", auto_error=not AUTH_DISABLED)
 
 
 POLLINATIONS_BASE_URL = os.getenv("POLLINATIONS_BASE_URL", "https://image.pollinations.ai/prompt")
@@ -297,6 +318,538 @@ class ConversationItem(BaseModel):
     summary: Optional[str]
     updated_at: datetime
     last_message: Optional[str] = None
+
+
+class EnterpriseRole(str, Enum):
+    ENTREPRISE = "ENTREPRISE"
+    OUVRIER = "OUVRIER"
+    SOUS_TRAITANT = "SOUS_TRAITANT"
+    CLIENT = "CLIENT"
+    FOURNISSEUR = "FOURNISSEUR"
+    VENDEUR = "VENDEUR"
+
+
+class ProjectScheduleStatus(str, Enum):
+    PREVU = "Prévu"
+    EN_COURS = "En cours"
+    TERMINE = "Terminé"
+
+
+class ProjectOrderStatus(str, Enum):
+    CREEE = "Créée"
+    CONFIRMEE = "Confirmée"
+    PRETE = "Prête"
+    LIVREE = "Livrée"
+
+
+class PickupMode(str, Enum):
+    LIVRAISON = "Livraison"
+    RETRAIT = "Retrait"
+
+
+class AnalysisStatus(str, Enum):
+    PENDING = "pending"
+    PROCESSING = "processing"
+    READY = "ready"
+
+
+class CompanyProfileModel(BaseModel):
+    id: str
+    name: str
+    siret: str
+    contact_email: EmailStr
+    phone: str
+    code: str
+    dtu_references: List[str] = Field(default_factory=list)
+    special_norms: List[str] = Field(default_factory=list)
+    authorizations: List[str] = Field(default_factory=list)
+
+
+class EnterpriseUserModel(BaseModel):
+    id: str
+    enterprise_id: str
+    role: EnterpriseRole
+    name: str
+    email: EmailStr
+    code: str
+    assigned_projects: List[str] = Field(default_factory=list)
+
+
+class ProjectDocumentModel(BaseModel):
+    id: str
+    name: str
+    mime_type: str
+    uploaded_at: datetime
+    uri: Optional[str] = None
+
+
+class ProjectScheduleItemModel(BaseModel):
+    id: str
+    label: str
+    start_date: date
+    end_date: date
+    status: ProjectScheduleStatus
+
+
+class ProjectOrderModel(BaseModel):
+    id: str
+    material: str
+    quantity: str
+    supplier: str
+    pickup_mode: PickupMode
+    assigned_worker_id: Optional[str] = None
+    status: ProjectOrderStatus
+    delivery_date: Optional[date] = None
+
+
+class ProjectProgressModel(BaseModel):
+    percent: int
+    updated_at: datetime
+    next_milestone: str
+
+
+class ProjectModel(BaseModel):
+    id: str
+    enterprise_id: str
+    name: str
+    client_name: str
+    client_email: EmailStr
+    address: str
+    code: str
+    start_date: date
+    end_date: date
+    documents: List[ProjectDocumentModel] = Field(default_factory=list)
+    schedule: List[ProjectScheduleItemModel] = Field(default_factory=list)
+    orders: List[ProjectOrderModel] = Field(default_factory=list)
+    progress: ProjectProgressModel
+    bill_of_materials: List[Dict[str, str]] = Field(default_factory=list)
+    analysis_status: AnalysisStatus
+
+
+class EnterpriseStateModel(BaseModel):
+    company: CompanyProfileModel
+    users: List[EnterpriseUserModel]
+    projects: List[ProjectModel]
+
+
+class CompanyUpsertRequest(BaseModel):
+    id: Optional[str] = None
+    name: str
+    siret: Optional[str] = None
+    contact_email: EmailStr
+    phone: str
+    code: Optional[str] = None
+    dtu_references: List[str] = Field(default_factory=list)
+    special_norms: List[str] = Field(default_factory=list)
+    authorizations: List[str] = Field(default_factory=list)
+
+
+class EnterpriseUserPayload(BaseModel):
+    id: Optional[str] = None
+    enterprise_id: Optional[str] = None
+    role: EnterpriseRole
+    name: str
+    email: EmailStr
+    code: Optional[str] = None
+    assigned_projects: List[str] = Field(default_factory=list)
+
+
+class ProjectDocumentPayload(BaseModel):
+    id: Optional[str] = None
+    name: str
+    mime_type: str
+    uploaded_at: datetime
+    uri: Optional[str] = None
+
+
+class ProjectScheduleItemPayload(BaseModel):
+    id: Optional[str] = None
+    label: str
+    start_date: date
+    end_date: date
+    status: ProjectScheduleStatus = ProjectScheduleStatus.PREVU
+
+
+class ProjectOrderPayload(BaseModel):
+    id: Optional[str] = None
+    material: str
+    quantity: str
+    supplier: str
+    pickup_mode: PickupMode = PickupMode.LIVRAISON
+    assigned_worker_id: Optional[str] = None
+    status: ProjectOrderStatus = ProjectOrderStatus.CREEE
+    delivery_date: Optional[date] = None
+
+
+class ProjectProgressPayload(BaseModel):
+    percent: int = Field(ge=0, le=100)
+    updated_at: datetime
+    next_milestone: str
+
+
+class BillOfMaterialItemPayload(BaseModel):
+    id: Optional[str] = None
+    label: str
+    value: str
+    source: str
+
+
+class ProjectUpsertRequest(BaseModel):
+    id: Optional[str] = None
+    enterprise_id: Optional[str] = None
+    name: str
+    client_name: str
+    client_email: EmailStr
+    address: str
+    code: Optional[str] = None
+    start_date: date
+    end_date: date
+    documents: List[ProjectDocumentPayload] = Field(default_factory=list)
+    schedule: List[ProjectScheduleItemPayload] = Field(default_factory=list)
+    orders: List[ProjectOrderPayload] = Field(default_factory=list)
+    progress: ProjectProgressPayload
+    bill_of_materials: List[BillOfMaterialItemPayload] = Field(default_factory=list)
+    analysis_status: AnalysisStatus = AnalysisStatus.PENDING
+
+
+def _generate_code(prefix: str, random_bytes: int = 3) -> str:
+    suffix = secrets.token_hex(random_bytes).upper()
+    return f"{prefix}-{suffix}"
+
+
+def _ensure_object_id(value: Optional[str], *, field: str) -> ObjectId:
+    if not value:
+        raise HTTPException(status_code=400, detail=f"{field} requis")
+    try:
+        return ObjectId(value)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"{field} invalide") from exc
+
+
+def _coerce_date(value: Any) -> date:
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value.split("T")[0])
+        except ValueError:
+            pass
+    raise HTTPException(status_code=500, detail="Date invalide en base")
+
+
+def _coerce_datetime(value: Any) -> datetime:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            pass
+    return datetime.utcnow()
+
+
+def _serialize_company(doc: Dict[str, Any]) -> CompanyProfileModel:
+    return CompanyProfileModel(
+        id=str(doc["_id"]),
+        name=doc.get("name", ""),
+        siret=doc.get("siret", "") or "",
+        contact_email=doc.get("contact_email"),
+        phone=doc.get("phone", ""),
+        code=doc.get("code", ""),
+        dtu_references=doc.get("dtu_references", []),
+        special_norms=doc.get("special_norms", []),
+        authorizations=doc.get("authorizations", []),
+    )
+
+
+def _serialize_enterprise_user(doc: Dict[str, Any]) -> EnterpriseUserModel:
+    return EnterpriseUserModel(
+        id=str(doc["_id"]),
+        enterprise_id=str(doc["enterprise_id"]),
+        role=EnterpriseRole(doc.get("role", EnterpriseRole.OUVRIER)),
+        name=doc.get("name", ""),
+        email=doc.get("email", ""),
+        code=doc.get("code", ""),
+        assigned_projects=doc.get("assigned_projects", []),
+    )
+
+
+def _serialize_project(doc: Dict[str, Any]) -> ProjectModel:
+    documents = [
+        ProjectDocumentModel(
+            id=d.get("id", str(ObjectId())),
+            name=d.get("name", ""),
+            mime_type=d.get("mime_type", "application/octet-stream"),
+            uploaded_at=_coerce_datetime(d.get("uploaded_at")),
+            uri=d.get("uri"),
+        )
+        for d in doc.get("documents", [])
+    ]
+    schedule = [
+        ProjectScheduleItemModel(
+            id=item.get("id", str(ObjectId())),
+            label=item.get("label", ""),
+            start_date=_coerce_date(item.get("start_date")),
+            end_date=_coerce_date(item.get("end_date")),
+            status=ProjectScheduleStatus(item.get("status", ProjectScheduleStatus.PREVU.value)),
+        )
+        for item in doc.get("schedule", [])
+    ]
+    orders = [
+        ProjectOrderModel(
+            id=order.get("id", str(ObjectId())),
+            material=order.get("material", ""),
+            quantity=order.get("quantity", ""),
+            supplier=order.get("supplier", ""),
+            pickup_mode=PickupMode(order.get("pickup_mode", PickupMode.LIVRAISON.value)),
+            assigned_worker_id=order.get("assigned_worker_id"),
+            status=ProjectOrderStatus(order.get("status", ProjectOrderStatus.CREEE.value)),
+            delivery_date=_coerce_date(order.get("delivery_date")) if order.get("delivery_date") else None,
+        )
+        for order in doc.get("orders", [])
+    ]
+    progress_payload = doc.get("progress") or {}
+    progress = ProjectProgressModel(
+        percent=int(progress_payload.get("percent", 0)),
+        updated_at=_coerce_datetime(progress_payload.get("updated_at")),
+        next_milestone=progress_payload.get("next_milestone", ""),
+    )
+    analysis_status = doc.get("analysis_status", AnalysisStatus.PENDING.value)
+    return ProjectModel(
+        id=str(doc["_id"]),
+        enterprise_id=str(doc["enterprise_id"]),
+        name=doc.get("name", ""),
+        client_name=doc.get("client_name", ""),
+        client_email=doc.get("client_email", ""),
+        address=doc.get("address", ""),
+        code=doc.get("code", ""),
+        start_date=_coerce_date(doc.get("start_date")),
+        end_date=_coerce_date(doc.get("end_date")),
+        documents=documents,
+        schedule=schedule,
+        orders=orders,
+        progress=progress,
+        bill_of_materials=doc.get("bill_of_materials", []),
+        analysis_status=AnalysisStatus(analysis_status),
+    )
+
+
+def _ensure_enterprise_for_user(user: Dict[str, Any]) -> Dict[str, Any]:
+    doc = enterprises_col.find_one({"owner_id": user["_id"]})
+    if doc:
+        return doc
+    now = datetime.utcnow()
+    template = {
+        "owner_id": user["_id"],
+        "name": user.get("display_name", "Entreprise Néo"),
+        "siret": "",
+        "contact_email": user.get("email"),
+        "phone": "",
+        "code": _generate_code("ENT"),
+        "dtu_references": [],
+        "special_norms": [],
+        "authorizations": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    inserted_id = enterprises_col.insert_one(template).inserted_id
+    doc = enterprises_col.find_one({"_id": inserted_id})
+    assert doc is not None
+    return doc
+
+
+def _get_enterprise_scope(current_user: Dict[str, Any]) -> Tuple[Dict[str, Any], ObjectId]:
+    enterprise = _ensure_enterprise_for_user(current_user)
+    enterprise_id = enterprise["_id"]
+    return enterprise, enterprise_id
+
+
+def _project_payload_to_doc(payload: ProjectUpsertRequest, enterprise_id: ObjectId) -> Dict[str, Any]:
+    documents = [
+        {
+            "id": item.id or str(ObjectId()),
+            "name": item.name,
+            "mime_type": item.mime_type,
+            "uploaded_at": item.uploaded_at,
+            "uri": item.uri,
+        }
+        for item in payload.documents
+    ]
+    schedule = [
+        {
+            "id": item.id or str(ObjectId()),
+            "label": item.label,
+            "start_date": item.start_date.isoformat(),
+            "end_date": item.end_date.isoformat(),
+            "status": item.status.value,
+        }
+        for item in payload.schedule
+    ]
+    orders = [
+        {
+            "id": item.id or str(ObjectId()),
+            "material": item.material,
+            "quantity": item.quantity,
+            "supplier": item.supplier,
+            "pickup_mode": item.pickup_mode.value,
+            "assigned_worker_id": item.assigned_worker_id,
+            "status": item.status.value,
+            "delivery_date": item.delivery_date.isoformat() if item.delivery_date else None,
+        }
+        for item in payload.orders
+    ]
+    bill_of_materials = [bom.dict() for bom in payload.bill_of_materials]
+    return {
+        "enterprise_id": enterprise_id,
+        "name": payload.name,
+        "client_name": payload.client_name,
+        "client_email": payload.client_email,
+        "address": payload.address,
+        "code": payload.code,
+        "start_date": payload.start_date.isoformat(),
+        "end_date": payload.end_date.isoformat(),
+        "documents": documents,
+        "schedule": schedule,
+        "orders": orders,
+        "progress": payload.progress.dict(),
+        "bill_of_materials": bill_of_materials,
+        "analysis_status": payload.analysis_status.value if isinstance(payload.analysis_status, AnalysisStatus) else payload.analysis_status,
+        "updated_at": datetime.utcnow(),
+    }
+
+
+@app.get("/enterprise/state", response_model=EnterpriseStateModel)
+def enterprise_state(current_user=Depends(get_current_user)):
+    enterprise, enterprise_id = _get_enterprise_scope(current_user)
+    users_cursor = enterprise_users_col.find({"enterprise_id": enterprise_id}).sort("name", ASCENDING)
+    projects_cursor = projects_col.find({"enterprise_id": enterprise_id}).sort("created_at", DESCENDING)
+    return EnterpriseStateModel(
+        company=_serialize_company(enterprise),
+        users=[_serialize_enterprise_user(doc) for doc in users_cursor],
+        projects=[_serialize_project(doc) for doc in projects_cursor],
+    )
+
+
+@app.put("/enterprise/company", response_model=CompanyProfileModel)
+def update_company(payload: CompanyUpsertRequest, current_user=Depends(get_current_user)):
+    enterprise, _ = _get_enterprise_scope(current_user)
+    updated_fields = {
+        "name": payload.name,
+        "siret": payload.siret or "",
+        "contact_email": payload.contact_email,
+        "phone": payload.phone,
+        "code": payload.code or enterprise.get("code") or _generate_code("ENT"),
+        "dtu_references": payload.dtu_references,
+        "special_norms": payload.special_norms,
+        "authorizations": payload.authorizations,
+        "updated_at": datetime.utcnow(),
+    }
+    enterprises_col.update_one({"_id": enterprise["_id"]}, {"$set": updated_fields})
+    enterprise.update(updated_fields)
+    return _serialize_company(enterprise)
+
+
+@app.post("/enterprise/users", response_model=EnterpriseUserModel)
+def create_enterprise_user(payload: EnterpriseUserPayload, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    now = datetime.utcnow()
+    doc = {
+        "enterprise_id": enterprise_id,
+        "role": payload.role.value,
+        "name": payload.name,
+        "email": payload.email,
+        "code": payload.code or _generate_code("USR"),
+        "assigned_projects": payload.assigned_projects,
+        "created_at": now,
+        "updated_at": now,
+    }
+    inserted = enterprise_users_col.insert_one(doc).inserted_id
+    saved = enterprise_users_col.find_one({"_id": inserted})
+    assert saved is not None
+    return _serialize_enterprise_user(saved)
+
+
+@app.put("/enterprise/users/{user_id}", response_model=EnterpriseUserModel)
+def update_enterprise_user(user_id: str, payload: EnterpriseUserPayload, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    obj_id = _ensure_object_id(user_id, field="user_id")
+    doc = enterprise_users_col.find_one({"_id": obj_id, "enterprise_id": enterprise_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    updates = {
+        "role": payload.role.value,
+        "name": payload.name,
+        "email": payload.email,
+        "code": payload.code or doc.get("code") or _generate_code("USR"),
+        "assigned_projects": payload.assigned_projects,
+        "updated_at": datetime.utcnow(),
+    }
+    enterprise_users_col.update_one({"_id": obj_id}, {"$set": updates})
+    doc.update(updates)
+    return _serialize_enterprise_user(doc)
+
+
+@app.delete("/enterprise/users/{user_id}")
+def delete_enterprise_user(user_id: str, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    obj_id = _ensure_object_id(user_id, field="user_id")
+    result = enterprise_users_col.delete_one({"_id": obj_id, "enterprise_id": enterprise_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Utilisateur introuvable")
+    projects_col.update_many(
+        {"enterprise_id": enterprise_id},
+        {"$pull": {"orders.$[].assigned_worker_id": user_id}},
+    )
+    return {"status": "deleted"}
+
+
+@app.post("/enterprise/projects", response_model=ProjectModel)
+def create_project(payload: ProjectUpsertRequest, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    base_doc = _project_payload_to_doc(payload, enterprise_id)
+    base_doc["code"] = payload.code or base_doc.get("code") or _generate_code("CH")
+    now = datetime.utcnow()
+    base_doc["created_at"] = now
+    inserted = projects_col.insert_one(base_doc).inserted_id
+    saved = projects_col.find_one({"_id": inserted})
+    assert saved is not None
+    return _serialize_project(saved)
+
+
+@app.put("/enterprise/projects/{project_id}", response_model=ProjectModel)
+def update_project(project_id: str, payload: ProjectUpsertRequest, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    obj_id = _ensure_object_id(project_id, field="project_id")
+    doc = projects_col.find_one({"_id": obj_id, "enterprise_id": enterprise_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Chantier introuvable")
+    updated = _project_payload_to_doc(payload, enterprise_id)
+    updated["code"] = payload.code or doc.get("code") or _generate_code("CH")
+    projects_col.update_one({"_id": obj_id}, {"$set": updated})
+    doc.update(updated)
+    return _serialize_project(doc)
+
+
+@app.get("/enterprise/projects/{project_id}", response_model=ProjectModel)
+def get_project(project_id: str, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    obj_id = _ensure_object_id(project_id, field="project_id")
+    doc = projects_col.find_one({"_id": obj_id, "enterprise_id": enterprise_id})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Chantier introuvable")
+    return _serialize_project(doc)
+
+
+@app.delete("/enterprise/projects/{project_id}")
+def delete_project(project_id: str, current_user=Depends(get_current_user)):
+    _, enterprise_id = _get_enterprise_scope(current_user)
+    obj_id = _ensure_object_id(project_id, field="project_id")
+    result = projects_col.delete_one({"_id": obj_id, "enterprise_id": enterprise_id})
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Chantier introuvable")
+    return {"status": "deleted"}
 
 
 CHAT_HISTORY_LIMIT = int(os.getenv("CHAT_HISTORY_LIMIT", "30"))
@@ -506,7 +1059,29 @@ def authenticate_user(email: str, password: str):
     return user
 
 
-def get_current_user(token: str = Depends(oauth2_scheme)):
+def _ensure_demo_user():
+    user = users.find_one({"email": AUTH_BYPASS_EMAIL})
+    if user:
+        return user
+    now = datetime.utcnow()
+    doc = {
+        "pseudo": AUTH_BYPASS_PSEUDO,
+        "email": AUTH_BYPASS_EMAIL,
+        "display_name": AUTH_BYPASS_NAME,
+        "password_hash": hash_password(secrets.token_urlsafe(16)),
+        "email_verified": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    users.insert_one(doc)
+    return doc
+
+
+def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
+    if AUTH_DISABLED:
+        return _ensure_demo_user()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentification requise")
     user_id = decode_jwt(token, expected_type="access")
     try:
         obj_id = ObjectId(user_id)
@@ -766,6 +1341,80 @@ async def _groq_chat(
         return data["choices"][0]["message"]["content"]
 
 
+async def _anthropic_chat(
+    prompt: str,
+    *,
+    temperature: float = 0.5,
+    max_tokens: Optional[int] = None,
+) -> str:
+    if not ANTHROPIC_API_KEY:
+        raise RuntimeError("Claude non configuré")
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": ANTHROPIC_VERSION,
+        "content-type": "application/json",
+    }
+    payload = {
+        "model": ANTHROPIC_MODEL,
+        "max_tokens": max_tokens or ANTHROPIC_MAX_TOKENS,
+        "temperature": temperature,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt,
+                    }
+                ],
+            }
+        ],
+    }
+    async with httpx.AsyncClient(timeout=45) as client:
+        try:
+            resp = await client.post(ANTHROPIC_BASE_URL, headers=headers, json=payload)
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as exc:
+            body_preview = exc.response.text[:400]
+            raise HTTPException(
+                status_code=502,
+                detail=f"Anthropic API error ({exc.response.status_code}): {body_preview or 'voir logs'}",
+            ) from exc
+        data = resp.json()
+        try:
+            return data["content"][0]["text"]
+        except (KeyError, IndexError):
+            raise HTTPException(status_code=502, detail="Réponse Anthropic invalide")
+
+
+async def _choose_llm_reply(
+    prompt: str,
+    *,
+    images: Optional[List[str]],
+    temperature: float,
+    max_tokens: Optional[int],
+) -> str:
+    if images:
+        return await _groq_chat(prompt, vision_images=images, temperature=temperature, max_tokens=max_tokens)
+    anthropic_error: Optional[Exception] = None
+    if ANTHROPIC_API_KEY:
+        try:
+            return await _anthropic_chat(prompt, temperature=temperature, max_tokens=max_tokens)
+        except Exception as exc:  # noqa: BLE001
+            anthropic_error = exc
+    try:
+        return await _groq_chat(prompt, temperature=temperature, max_tokens=max_tokens)
+    except Exception as groq_exc:  # noqa: BLE001
+        if anthropic_error and isinstance(anthropic_error, HTTPException):
+            raise anthropic_error
+        if anthropic_error:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Anthropic échec: {anthropic_error}; fallback Groq échec: {groq_exc}",
+            ) from groq_exc
+        raise
+
+
 def _store_image(user_id: ObjectId, file: UploadFile, content: bytes) -> str:
     image_id = str(uuid.uuid4())
     images_col.insert_one(
@@ -925,9 +1574,9 @@ async def ai_chat(payload: ChatRequest, request: Request):
         prompt_parts.append("(Le bot peut utiliser des recherches web disponibles.)")
     prompt = "\n".join(prompt_parts)
 
-    reply = await _groq_chat(
+    reply = await _choose_llm_reply(
         prompt,
-        vision_images=payload.images,
+        images=payload.images,
         temperature=payload.temperature,
         max_tokens=payload.max_tokens,
     )
