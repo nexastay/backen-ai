@@ -116,8 +116,8 @@ AUTH_DISABLED = os.getenv("AUTH_DISABLED", "false").lower() == "true"
 AUTH_BYPASS_EMAIL = os.getenv("AUTH_BYPASS_EMAIL", "demo@neo.local")
 AUTH_BYPASS_PSEUDO = os.getenv("AUTH_BYPASS_PSEUDO", "demo")
 AUTH_BYPASS_NAME = os.getenv("AUTH_BYPASS_NAME", "Demo User")
-EMAIL_SENDER = get_env("MAIL_CONFIRMATION")
-EMAIL_PASSWORD = get_env("MOT_DE_PASSE_CONFIRMATION")
+EMAIL_SENDER = os.getenv("MAIL_CONFIRMATION")
+EMAIL_PASSWORD = os.getenv("MOT_DE_PASSE_CONFIRMATION")
 EMAIL_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("SMTP_PORT", "587"))
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3000")
@@ -720,6 +720,40 @@ def _project_payload_to_doc(payload: ProjectUpsertRequest, enterprise_id: Object
     }
 
 
+def _ensure_demo_user():
+    user = users.find_one({"email": AUTH_BYPASS_EMAIL})
+    if user:
+        return user
+    now = datetime.utcnow()
+    doc = {
+        "pseudo": AUTH_BYPASS_PSEUDO,
+        "email": AUTH_BYPASS_EMAIL,
+        "display_name": AUTH_BYPASS_NAME,
+        "password_hash": hash_password(secrets.token_urlsafe(16)),
+        "email_verified": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    users.insert_one(doc)
+    return doc
+
+
+def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
+    if AUTH_DISABLED:
+        return _ensure_demo_user()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    user_id = decode_jwt(token, expected_type="access")
+    try:
+        obj_id = ObjectId(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Token invalide") from exc
+    user = users.find_one({"_id": obj_id})
+    if not user:
+        raise HTTPException(status_code=401, detail="Utilisateur introuvable")
+    return user
+
+
 @app.get("/enterprise/state", response_model=EnterpriseStateModel)
 def enterprise_state(current_user=Depends(get_current_user)):
     enterprise, enterprise_id = _get_enterprise_scope(current_user)
@@ -1056,40 +1090,6 @@ def authenticate_user(email: str, password: str):
         return None
     if not verify_password(password, user["password_hash"]):
         return None
-    return user
-
-
-def _ensure_demo_user():
-    user = users.find_one({"email": AUTH_BYPASS_EMAIL})
-    if user:
-        return user
-    now = datetime.utcnow()
-    doc = {
-        "pseudo": AUTH_BYPASS_PSEUDO,
-        "email": AUTH_BYPASS_EMAIL,
-        "display_name": AUTH_BYPASS_NAME,
-        "password_hash": hash_password(secrets.token_urlsafe(16)),
-        "email_verified": True,
-        "created_at": now,
-        "updated_at": now,
-    }
-    users.insert_one(doc)
-    return doc
-
-
-def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
-    if AUTH_DISABLED:
-        return _ensure_demo_user()
-    if not token:
-        raise HTTPException(status_code=401, detail="Authentification requise")
-    user_id = decode_jwt(token, expected_type="access")
-    try:
-        obj_id = ObjectId(user_id)
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=401, detail="Token invalide") from exc
-    user = users.find_one({"_id": obj_id})
-    if not user:
-        raise HTTPException(status_code=401, detail="Utilisateur introuvable")
     return user
 
 
