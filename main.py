@@ -1093,6 +1093,40 @@ def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
     return user
 
 
+def _ensure_demo_user():
+    user = users.find_one({"email": AUTH_BYPASS_EMAIL})
+    if user:
+        return user
+    now = datetime.utcnow()
+    doc = {
+        "pseudo": AUTH_BYPASS_PSEUDO,
+        "email": AUTH_BYPASS_EMAIL,
+        "display_name": AUTH_BYPASS_NAME,
+        "password_hash": hash_password(secrets.token_urlsafe(16)),
+        "email_verified": True,
+        "created_at": now,
+        "updated_at": now,
+    }
+    users.insert_one(doc)
+    return doc
+
+
+def get_current_user(token: Optional[str] = Depends(oauth2_scheme)):
+    if AUTH_DISABLED:
+        return _ensure_demo_user()
+    if not token:
+        raise HTTPException(status_code=401, detail="Authentification requise")
+    user_id = decode_jwt(token, expected_type="access")
+    try:
+        obj_id = ObjectId(user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=401, detail="Token invalide") from exc
+    user = users.find_one({"_id": obj_id})
+    if not user:
+        raise HTTPException(status_code=401, detail="Utilisateur introuvable")
+    return user
+
+
 async def _ws_get_user(websocket: WebSocket):
     token = websocket.query_params.get("token")
     if not token:
