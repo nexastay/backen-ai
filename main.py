@@ -1494,7 +1494,8 @@ async def upload_image(file: UploadFile = File(...), current_user=Depends(get_cu
 
 
 @app.post("/ai/generate-image", response_model=ImageGenerationResponse)
-async def generate_image(payload: ImageGenerationRequest, current_user=Depends(get_current_user)):
+async def generate_image(payload: ImageGenerationRequest, request: Request):
+    current_user = _optional_user_from_request(request)
     prompt = payload.prompt.strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Prompt obligatoire")
