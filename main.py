@@ -245,10 +245,11 @@ class ChatRequest(BaseModel):
     mode: str = "chat"  # chat|code|reasoning
     bot_name: Optional[str] = "Neo"
     user_name: Optional[str] = "Utilisateur"
-    images: Optional[List[str]] = None
     search: bool = False
+    images: Optional[List[str]] = None
+    temperature: float = 0.4
     max_tokens: Optional[int] = None
-    temperature: float = 0.5
+    user_id: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
