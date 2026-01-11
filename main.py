@@ -1298,25 +1298,30 @@ async def _crawl(url: str, max_bytes: int = 200_000) -> str:
 
 async def _search(query: str, max_results: int) -> List[Dict[str, str]]:
     results: List[Dict[str, str]] = []
-    if WEB_SEARCH_ENABLED and SERPAPI_KEY:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                "https://serpapi.com/search",
-                params={"q": query, "engine": "google", "api_key": SERPAPI_KEY, "num": max_results},
-            )
-            r.raise_for_status()
-            data = r.json()
-            for item in data.get("organic_results", [])[:max_results]:
-                results.append({"title": item.get("title", ""), "link": item.get("link", "")})
-        if results:
-            return results
-    if WEB_SEARCH_ENABLED and not results:
+    if not WEB_SEARCH_ENABLED:
+        return results
+
+    try:
+        if SERPAPI_KEY:
+            async with httpx.AsyncClient(timeout=10) as client:
+                r = await client.get(
+                    "https://serpapi.com/search",
+                    params={"q": query, "engine": "google", "api_key": SERPAPI_KEY, "num": max_results},
+                )
+                r.raise_for_status()
+                data = r.json()
+                for item in data.get("organic_results", [])[:max_results]:
+                    results.append({"title": item.get("title", ""), "link": item.get("link", "")})
+            if results:
+                return results
+
         # Fallback DuckDuckGo HTML (gratuit, sans clé)
         async with httpx.AsyncClient(timeout=10) as client:
             r = await client.get(
-                "https://duckduckgo.com/html/",
+                "https://html.duckduckgo.com/html/",
                 params={"q": query},
                 headers={"User-Agent": "Mozilla/5.0 (compatible; NeoBot/1.0)"},
+                follow_redirects=True,
             )
             r.raise_for_status()
             soup = BeautifulSoup(r.text, "html.parser")
@@ -1325,6 +1330,10 @@ async def _search(query: str, max_results: int) -> List[Dict[str, str]]:
                 href = a.get("href")
                 if href and title:
                     results.append({"title": title, "link": href})
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Search] ⚠️ Impossible d'effectuer la recherche web ({exc})")
+        return []
+
     return results
 
 
