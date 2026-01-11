@@ -1013,9 +1013,13 @@ def favicon():
     return Response(content=DEFAULT_FAVICON, media_type="image/png")
 
 
-@app.get("/health")
-def health():
-    return {"status": "ok", "service": PROJECT_NAME}
+@app.get("/")
+def root():
+    return {"status": "Neo backend up"}
+
+@app.head("/")
+async def head_root():
+    return Response(status_code=200)
 
 
 @app.post("/auth/register")
