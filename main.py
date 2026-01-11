@@ -130,7 +130,7 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-20241022")
 ANTHROPIC_VERSION = os.getenv("ANTHROPIC_VERSION", "2023-06-01")
 ANTHROPIC_MAX_TOKENS = int(os.getenv("ANTHROPIC_MAX_TOKENS", "1024"))
 ANTHROPIC_BASE_URL = os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1/messages")
-WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "false").lower() == "true"
+WEB_SEARCH_ENABLED = os.getenv("WEB_SEARCH_ENABLED", "true").lower() == "true"
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 FACE_RECO_THRESHOLD = float(os.getenv("FACE_RECO_THRESHOLD", "0.75"))
@@ -1610,8 +1610,14 @@ async def ai_chat(payload: ChatRequest, request: Request):
         content = msg.get("content", "")
         prompt_parts.append(f"{role}: {content}")
     prompt_parts.append(f"{payload.user_name or 'Utilisateur'}: {payload.message}")
+    
+    # Si search=True, faire une VRAIE recherche web et injecter les résultats
     if payload.search:
-        prompt_parts.append("(Le bot peut utiliser des recherches web disponibles.)")
+        search_results = await _search(payload.message, 3)
+        if search_results:
+            search_context = "\n".join([f"- {r['title']}: {r['link']}" for r in search_results])
+            prompt_parts.append(f"\n[Résultats de recherche web pour '{payload.message}']:\n{search_context}\n")
+        prompt_parts.append("Utilise les informations de recherche ci-dessus pour répondre précisément.")
     prompt = "\n".join(prompt_parts)
 
     reply = await _choose_llm_reply(
@@ -1777,8 +1783,14 @@ async def ws_ai_chat(websocket: WebSocket):
                 content = msg_doc.get("content", "")
                 prompt_parts.append(f"{role}: {content}")
             prompt_parts.append(f"{user_name}: {message}")
+            
+            # Si search=True, faire une VRAIE recherche web
             if use_search:
-                prompt_parts.append("(Le bot peut utiliser des recherches web disponibles.)")
+                search_results = await _search(message, 3)
+                if search_results:
+                    search_context = "\n".join([f"- {r['title']}: {r['link']}" for r in search_results])
+                    prompt_parts.append(f"\n[Résultats de recherche web]:\n{search_context}\n")
+                prompt_parts.append("Utilise ces informations pour répondre précisément.")
             prompt = "\n".join(prompt_parts)
 
             try:
