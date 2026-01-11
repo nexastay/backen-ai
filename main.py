@@ -135,11 +135,11 @@ SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 SERPAPI_KEY = os.getenv("SERPAPI_KEY")
 FACE_RECO_THRESHOLD = float(os.getenv("FACE_RECO_THRESHOLD", "0.75"))
 VOSK_MODEL_PATH = os.getenv("VOSK_MODEL_PATH")  # chemin vers un modèle Vosk (optionnel)
-ALLOWED_ORIGINS: Sequence[str] = [
-    origin.strip()
-    for origin in os.getenv("CORS_ORIGINS", "").split(",")
-    if origin.strip()
-]
+_cors_env = os.getenv("CORS_ORIGINS", "").strip()
+ALLOWED_ORIGINS: Sequence[str] = (
+    [origin.strip() for origin in _cors_env.split(",") if origin.strip()]
+    if _cors_env else ["*"]  # Allow all origins if not specified (for APK/mobile)
+)
 RATE_LIMIT_WINDOW_SEC = int(os.getenv("RATE_LIMIT_WINDOW_SEC", "60"))
 RATE_LIMIT_MAX_ATTEMPTS = int(os.getenv("RATE_LIMIT_MAX_ATTEMPTS", "10"))
 FAILED_ATTEMPTS: Dict[str, Dict[str, int]] = {}
@@ -183,14 +183,14 @@ pwd_context = CryptContext(schemes=["pbkdf2_sha256"], deprecated="auto")
 serializer = URLSafeTimedSerializer(JWT_SECRET)
 app = FastAPI(title=f"{PROJECT_NAME} Auth API")
 
-if ALLOWED_ORIGINS:
-    app.add_middleware(
-        CORSMiddleware,
-        allow_origins=list(ALLOWED_ORIGINS),
-        allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
-    )
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,  # Must be False when using wildcard origins
+    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
 
 PASSWORD_REGEX = re.compile(
     r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$"
