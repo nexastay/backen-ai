@@ -1022,6 +1022,13 @@ async def head_root():
     return Response(status_code=200)
 
 
+if __name__ == "__main__":
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8000"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
+
 @app.post("/auth/register")
 def register(payload: SignupRequest):
     if len(payload.password.encode("utf-8")) > 72:
