@@ -1337,6 +1337,223 @@ async def _search(query: str, max_results: int) -> List[Dict[str, str]]:
     return results
 
 
+WEATHER_KEYWORDS = ("meteo", "météo", "weather", "temps", "temperature")
+WEATHER_STOP_WORDS = {
+    "aujourd'hui",
+    "aujourdhui",
+    "auj",
+    "ajd",
+    "demain",
+    "maintenant",
+    "svp",
+    "stp",
+    "please",
+    "merci",
+    "meteo",
+    "météo",
+    "weather",
+    "temps",
+    "temperature",
+    "forecast",
+}
+WEATHER_CITY_AFTER_KEYWORD = re.compile(
+    r"(?:meteo|météo|weather|temps|temperature)\s*(?:a|à|au|en|pour|sur|de|du|des)?\s*([A-Za-zÀ-ÖØ-öø-ÿ' -]{2,})",
+    re.IGNORECASE,
+)
+WEATHER_CITY_AFTER_PREP = re.compile(
+    r"(?:à|a|au|en|sur|pour)\s+([A-Za-zÀ-ÖØ-öø-ÿ' -]{2,})",
+    re.IGNORECASE,
+)
+WEATHER_CODE_MAP: Dict[int, str] = {
+    0: "ciel dégagé",
+    1: "temps clair",
+    2: "quelques nuages",
+    3: "couvert",
+    45: "brouillard",
+    48: "brouillard givrant",
+    51: "bruine faible",
+    53: "bruine modérée",
+    55: "bruine dense",
+    56: "bruine verglaçante faible",
+    57: "bruine verglaçante dense",
+    61: "pluie faible",
+    63: "pluie modérée",
+    65: "forte pluie",
+    66: "pluie verglaçante faible",
+    67: "pluie verglaçante forte",
+    71: "chute de neige légère",
+    73: "chute de neige modérée",
+    75: "chute de neige forte",
+    77: "grésil",
+    80: "averses faibles",
+    81: "averses modérées",
+    82: "fortes averses",
+    85: "averses de neige faibles",
+    86: "averses de neige fortes",
+    95: "orages",
+    96: "orages avec grêle",
+    99: "orages violents avec grêle",
+}
+
+
+def _clean_city_phrase(raw: str) -> Optional[str]:
+    if not raw:
+        return None
+    raw = raw.strip(" ,.;:!?")
+    if not raw:
+        return None
+    tokens = [tok for tok in re.split(r"\s+", raw) if tok]
+    cleaned: List[str] = []
+    for token in tokens:
+        normalized = token.lower().strip(" ,.;:!?")
+        if normalized in WEATHER_STOP_WORDS:
+            break
+        cleaned.append(token.strip(" ,.;:!?"))
+        if len(cleaned) >= 3:
+            continue
+    if not cleaned:
+        return None
+    return " ".join(cleaned)
+
+
+def _extract_weather_city(message: str) -> Optional[str]:
+    lowered = message.lower()
+    if not any(keyword in lowered for keyword in WEATHER_KEYWORDS):
+        return None
+    match = WEATHER_CITY_AFTER_KEYWORD.search(message)
+    if match:
+        candidate = _clean_city_phrase(match.group(1))
+        if candidate:
+            return candidate
+    match = WEATHER_CITY_AFTER_PREP.search(message)
+    if match:
+        candidate = _clean_city_phrase(match.group(1))
+        if candidate:
+            return candidate
+    sanitized = lowered
+    for keyword in WEATHER_KEYWORDS:
+        sanitized = sanitized.replace(keyword, " ")
+    sanitized = re.sub(r"\b(?:a|à|au|en|dans|pour|sur|de|du|des|la|le|les)\b", " ", sanitized)
+    candidate = _clean_city_phrase(sanitized)
+    if candidate:
+        return candidate.title()
+    return None
+
+
+def _describe_weather_code(code: Optional[int]) -> str:
+    if code is None:
+        return "conditions inconnues"
+    return WEATHER_CODE_MAP.get(code, f"conditions code {code}")
+
+
+def _format_hour_label(iso_ts: Optional[str]) -> str:
+    if not iso_ts:
+        return ""
+    iso_ts = iso_ts.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(iso_ts)
+        if dt.tzinfo:
+            dt = dt.astimezone(timezone.utc)
+        return dt.strftime("%d/%m %Hh")
+    except ValueError:
+        return iso_ts.replace("T", " ")
+
+
+async def _fetch_weather_context(city_query: str) -> Optional[str]:
+    async with httpx.AsyncClient(timeout=10) as client:
+        geo_resp = await client.get(
+            "https://geocoding-api.open-meteo.com/v1/search",
+            params={"name": city_query, "count": 1, "language": "fr"},
+        )
+        geo_resp.raise_for_status()
+        geo_data = geo_resp.json()
+        matches = geo_data.get("results") or []
+        if not matches:
+            return None
+        place = matches[0]
+        city_name = place.get("name") or city_query.title()
+        admin = place.get("admin1")
+        country = place.get("country")
+        lat = place.get("latitude")
+        lon = place.get("longitude")
+        tz_name = place.get("timezone") or "auto"
+        forecast_resp = await client.get(
+            "https://api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lat,
+                "longitude": lon,
+                "current_weather": True,
+                "hourly": "temperature_2m,apparent_temperature,precipitation_probability",
+                "timezone": tz_name,
+            },
+        )
+        forecast_resp.raise_for_status()
+        forecast_data = forecast_resp.json()
+
+    current = forecast_data.get("current_weather")
+    if not current:
+        return None
+    hourly = forecast_data.get("hourly") or {}
+    times = hourly.get("time") or []
+    temps = hourly.get("temperature_2m") or []
+    feels = hourly.get("apparent_temperature") or []
+    precip = hourly.get("precipitation_probability") or []
+    cw_time = current.get("time")
+    start_idx = times.index(cw_time) if cw_time in times else 0
+    apparent_now = feels[start_idx] if start_idx < len(feels) else None
+    location_label = ", ".join(filter(None, [city_name, admin, country]))
+
+    forecast_lines: List[str] = []
+    for i in range(start_idx, min(len(times), start_idx + 3)):
+        label = _format_hour_label(times[i]) or times[i]
+        temp_val = temps[i] if i < len(temps) else None
+        feel_val = feels[i] if i < len(feels) else None
+        precip_val = precip[i] if i < len(precip) else None
+        if temp_val is None:
+            continue
+        line = f"{label}: {float(temp_val):.1f}°C"
+        if feel_val is not None:
+            line += f" (ressenti {float(feel_val):.1f}°C)"
+        if precip_val is not None:
+            line += f", pluie {int(precip_val)}%"
+        forecast_lines.append(line)
+
+    temp_now = current.get("temperature")
+    wind = current.get("windspeed")
+    wind_dir = current.get("winddirection")
+    desc = _describe_weather_code(current.get("weathercode"))
+
+    parts = [
+        f"Données Open-Meteo pour {location_label or city_query.title()} (lat {lat:.2f}, lon {lon:.2f}, fuseau {tz_name})."
+    ]
+    current_line = f"Conditions actuelles ({cw_time}): {desc}"
+    if temp_now is not None:
+        current_line += f", {float(temp_now):.1f}°C"
+    if apparent_now is not None:
+        current_line += f" (ressenti {float(apparent_now):.1f}°C)"
+    if wind is not None:
+        wind_text = f"{float(wind):.0f} km/h"
+        if wind_dir is not None:
+            wind_text += f" direction {int(wind_dir)}°"
+        current_line += f", vent {wind_text}"
+    parts.append(current_line)
+    if forecast_lines:
+        parts.append("Prochaines heures: " + " | ".join(forecast_lines))
+    parts.append("Source: https://open-meteo.com/")
+    return "\n".join(parts)
+
+
+async def _maybe_weather_context(message: str) -> Optional[str]:
+    city = _extract_weather_city(message)
+    if not city:
+        return None
+    try:
+        return await _fetch_weather_context(city)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[Weather] ⚠️ Impossible de récupérer la météo pour '{city}': {exc}")
+        return None
+
+
 async def _groq_chat(
     prompt: str,
     vision_images: Optional[List[str]] = None,
@@ -1627,6 +1844,10 @@ async def ai_chat(payload: ChatRequest, request: Request):
             search_context = "\n".join([f"- {r['title']}: {r['link']}" for r in search_results])
             prompt_parts.append(f"\n[Résultats de recherche web pour '{payload.message}']:\n{search_context}\n")
         prompt_parts.append("Utilise les informations de recherche ci-dessus pour répondre précisément.")
+    weather_context = await _maybe_weather_context(payload.message)
+    if weather_context:
+        prompt_parts.append(f"\n[Données météo fiables]:\n{weather_context}\n")
+        prompt_parts.append("Réponds en utilisant exclusivement les données météo ci-dessus (pas d'invention).")
     prompt = "\n".join(prompt_parts)
 
     reply = await _choose_llm_reply(
@@ -1800,6 +2021,10 @@ async def ws_ai_chat(websocket: WebSocket):
                     search_context = "\n".join([f"- {r['title']}: {r['link']}" for r in search_results])
                     prompt_parts.append(f"\n[Résultats de recherche web]:\n{search_context}\n")
                 prompt_parts.append("Utilise ces informations pour répondre précisément.")
+            weather_context = await _maybe_weather_context(message)
+            if weather_context:
+                prompt_parts.append(f"\n[Données météo fiables]:\n{weather_context}\n")
+                prompt_parts.append("Réponds en utilisant exclusivement les données météo ci-dessus.")
             prompt = "\n".join(prompt_parts)
 
             try:
